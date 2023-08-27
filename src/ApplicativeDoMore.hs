@@ -16,7 +16,10 @@ import Language.Haskell.TH qualified as TH
 
 plugin :: GHC.Plugin
 plugin = GHC.defaultPlugin
-    { GHC.renamedResultAction = applicativeDoMorePlugin
+    { GHC.renamedResultAction
+        = \ _cli -> applicativeDoMorePlugin _cli
+    , GHC.pluginRecompile
+        = \ _cli -> pure GHC.NoForceRecompile
     }
 
 applicativeDoMorePlugin
