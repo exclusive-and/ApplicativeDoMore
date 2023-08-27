@@ -17,18 +17,18 @@ import Language.Haskell.TH qualified as TH
 plugin :: GHC.Plugin
 plugin = GHC.defaultPlugin
     { GHC.renamedResultAction
-        = \ _cli -> applicativeDoMorePlugin _cli
+        = afterRename
     , GHC.pluginRecompile
         = \ _cli -> pure GHC.NoForceRecompile
     }
 
-applicativeDoMorePlugin
+afterRename
     :: [GHC.CommandLineOption]
     -> GHC.TcGblEnv
     -> HsGroup GhcRn
     -> GHC.TcM (GHC.TcGblEnv, HsGroup GhcRn)
 
-applicativeDoMorePlugin _cli env hsgroup =
+afterRename _cli env hsgroup =
     (env,) <$> applicativeDoRewrite hsgroup
 
 
