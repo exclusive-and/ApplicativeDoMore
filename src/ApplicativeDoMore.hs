@@ -4,7 +4,9 @@ module ApplicativeDoMore where
 import Data.Generics qualified as SYB
 import GHC.Hs
 import GHC.Plugins qualified as GHC
+import GHC.Rename.Expr qualified as Rename
 import GHC.Tc.Types qualified as GHC
+import GHC.Tc.Utils.Monad qualified as GHC
 import GHC.Types.Basic
 import GHC.Types.Name.Set
 import GHC.Types.SrcLoc
@@ -22,6 +24,14 @@ plugin = GHC.defaultPlugin
         = \ _cli -> pure GHC.NoForceRecompile
     }
 
+-- TODOs:
+-- 
+--  - Rename statements to get free variable sets.
+--  
+--  - Dependency analysis.
+--  
+--  - 
+    
 afterRename
     :: [GHC.CommandLineOption]
     -> GHC.TcGblEnv
@@ -42,36 +52,10 @@ applicativeDoRewrite
 applicativeDoRewrite = SYB.everywhereM (SYB.mkM rewrite)
     where
     rewrite :: LHsExpr GhcPs -> GHC.TcM (LHsExpr GhcPs)
-    rewrite (L loc (HsDo _ _ctx (L _ stmts))) = do
-        undefined
+    
+    rewrite e@(L loc (HsDo _ _flavour (L _ stmts))) = do
+        GHC.printForUserTcRn $ GHC.ppr stmts
+        pure e
+        
     rewrite e = pure e
 
-
-data ApplicativeTree' a
-    = One   a
-    | Bind  (ApplicativeTree' a) (ApplicativeTree' a)
-    | App   [ApplicativeTree' a]
-
-type ApplicativeStmt = (ExprLStmt GhcPs, FreeVars)
-type ApplicativeTree = ApplicativeTree' ApplicativeStmt
-
-    
-applicativeTree :: [ApplicativeStmt] -> ApplicativeTree
-applicativeTree [one] = One one
-applicativeTree stmts =
-    case segments stmts of
-        [one] -> split one
-        segs  -> App (map split segs)
-    where
-        split [one] = One one
-        split stmts = Bind (applicativeTree before) (applicativeTree after)
-            where (before, after) = separate stmts
-
-segments :: [ApplicativeStmt] -> [[ApplicativeStmt]]
-segments = undefined
-
-separate
-    :: [ApplicativeStmt]
-    -> ([ApplicativeStmt], [ApplicativeStmt])
-
-separate = undefined
