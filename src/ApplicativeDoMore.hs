@@ -36,6 +36,22 @@ afterRename _cli env hsgroup = do
 -- * Applicative Do Rewrite Rule
 ---------------------------------------------------------------------
 
+-- |
+-- Rewrite do-expressions so that 'LetStmt's only incur an 'Applicative'
+-- constraint in TC.
+-- 
+-- GHC's renamer does the heavy lifting. All that's left to do is:
+-- 
+--  - Find all the 'LetStmt's that can be moved.
+--
+--  - Rewrite the 'LastStmt' as a let-expression with the bindings from the
+--    moveable 'LetStmt's.
+--
+--  - Remove 'join' calls from any 'ApplicativeStmt's.
+-- 
+-- If any one of these steps fails, we fall back on the original expression
+-- and let TC incur the 'Monad' constraint.
+-- 
 applicativeDoRewrite
     :: HsGroup GhcRn
     -> GHC.TcM (HsGroup GhcRn)
@@ -49,22 +65,32 @@ applicativeDoRewrite = SYB.everywhereM (SYB.mkM rewriteLExpr)
     
     rewrite (HsDo _ flavour (L loc stmts0)) = do
         GHC.traceRn "applicativeDoRewrite" $ GHC.ppr stmts0
-        stmts1 <- rearrangeLStmts flavour stmts0
-        stmts2 <- postprocessLStmts stmts1
+        stmts1 <- rewriteDoStmts flavour stmts0
+        stmts2 <- postprocessApplicativeStmts stmts1
         GHC.traceRn "applicativeDoRewrite" $ GHC.ppr stmts2
         pure (HsDo noExtField flavour (L loc stmts2))
         
     rewrite e = pure e
 
+
 -- * Do-Expression Rearrangement
 ---------------------------------------------------------------------
-    
-rearrangeLStmts
+
+-- |
+-- Try to rewrite the statements in a do-expression so that it doesn't incur
+-- a 'Monad' constraint.
+-- 
+-- Skips rewriting if 'rearrangeLetStmts' fails.
+-- 
+rewriteDoStmts
     :: HsDoFlavour
     -> [ExprLStmt GhcRn]
     -> GHC.TcM [ExprLStmt GhcRn]
     
-rearrangeLStmts flavour = go . reverse
+rewriteDoStmts flavour = go . reverse
+    -- Note that we process statements in reverse order. This allows
+    -- 'rearrangeLetStmts' to move let-statements that bind variables in
+    -- other let-statements. See [Variables bindings in moveable expressions].
     where
     go (stmt@(L loc (LastStmt _ body stripped ret)) : stmts) = do
         re <- rearrangeLetStmts stmts
@@ -76,6 +102,12 @@ rearrangeLStmts flavour = go . reverse
         
     go _ = error "No last statement"
 
+-- |
+-- Try to collect and move 'LetStmt' bindings.
+-- 
+-- Fails if the main body of the do-expression is anything but 'LetStmt's or
+-- 'ApplicativeStmt's. Any other statements irrevocably invoke monadic binds.
+-- 
 rearrangeLetStmts
     :: [ExprLStmt GhcRn]
     -> GHC.TcM (Maybe (ValBinds, [ExprLStmt GhcRn]))
@@ -83,23 +115,40 @@ rearrangeLetStmts
 rearrangeLetStmts = go emptyValBinds []
     where
     go
-        :: ValBinds                  -- Movable bindings
-        -> [ExprLStmt GhcRn]         -- Statements we've kept the same
+        :: ValBinds                  -- Moveable bindings
+        -> [ExprLStmt GhcRn]         -- Statements to keep the same
         -> [ExprLStmt GhcRn]         -- Statements left to process
         -> GHC.TcM (Maybe (ValBinds, [ExprLStmt GhcRn]))
     
     go move same [] = pure (Just (move, same))
     
+    -- Check whether a 'LetStmt' binds variables in later statements.
+    -- 
+    -- If they don't bind variables in anything but the 'LastStmt', then
+    -- it's safe to move them.
+    -- 
+    -- If they do bind variables in other statements, leave them as-is.
+    -- These will incur a 'Monad' constraint, but there's nothing we can do.
+    -- 
+    -- [Variable bindings in moveable expressions]
+    -- Note that we don't check the expressions we already plan to move.
+    -- We view this statement binding a variable in one of those expressions
+    -- as if it were binding a variable in the 'LastStmt'.
     go move same (stmt@(L _ (LetStmt _ binds)) : stmts) = do
         let bindNames = mkNameSet $ collectBinders binds
         binds' <- collectBinds binds
-        if bindsIn bindNames same
+        if bindNames `bindsIn` same
             then go move (stmt : same) stmts
             else go (binds' `appendBinds` move) same stmts
     
+    -- Leave 'ApplicativeStmt's as-is.
+    -- 
+    -- TODO: Recursively find moveable 'LetStmt's inside 'ApplicativeStmt's.
     go move same (stmt@(L _ ApplicativeStmt{}) : stmts) =
         go move (stmt : same) stmts
     
+    -- If we get something other than a 'LetStmt' or an 'ApplicativeStmt',
+    -- then we'll incur 'Monad' anyway. Fail out immediately.
     go _move _same _ = pure Nothing
     
 -- |
@@ -132,17 +181,23 @@ rewriteLast
     -> SyntaxExpr GhcRn
     -> GHC.TcM (ExprStmt GhcRn)
     
-rewriteLast ctx binds body stripped ret = do
+rewriteLast ctx binds body _stripped ret = do
     (returnName, _) <- lookupQualifiedDoName (HsDoStmt ctx) returnMName
     (pureName  , _) <- lookupQualifiedDoName (HsDoStmt ctx) pureAName
     
     let binds' :: HsLocalBinds GhcRn
         binds' = HsValBinds noAnn $ XValBindsLR binds
     
-    let body' = rewriteReturn returnName pureName (noLocA . mkHsLet binds') body
+    let body' = rewriteReturn returnName pureName (noLocA . mkHsLet binds')
+                              body
     
     pure (LastStmt noExtField body' (Just True) ret)
 
+-- |
+-- Rewrite the return expression at the end of a do-expression.
+-- 
+-- Strips occurrences of 'return' or 'pure'.
+-- 
 rewriteReturn
     :: GHC.Name
     -> GHC.Name
@@ -153,11 +208,11 @@ rewriteReturn
 rewriteReturn returnName pureName rewriteLet (L loc e) =
     case e of
         -- return $ or pure $
-        OpApp x l op r
+        OpApp _x l op r
             | isReturn l, isDollar op
             -> rewriteLet r
         -- return or pure, without $
-        HsApp x f arg
+        HsApp _x f arg
             | isReturn f
             -> rewriteLet arg
         _
@@ -176,8 +231,15 @@ rewriteReturn returnName pureName rewriteLet (L loc e) =
 -- * ApplicativeStmt Post-Processing
 ---------------------------------------------------------------------
 
-postprocessLStmts :: [ExprLStmt GhcRn] -> GHC.TcM [ExprLStmt GhcRn]
-postprocessLStmts lstmts = go [] $ reverse lstmts
+-- |
+-- Try to remove any calls to 'join' from the 'ApplicativeStmt's. This is
+-- what ultimately signals to TC that we only need 'Applicative'.
+-- 
+-- If we find that we can't remove 'join' from one of the statements, fall
+-- back on the original expression with 'join's intact.
+-- 
+postprocessApplicativeStmts :: [ExprLStmt GhcRn] -> GHC.TcM [ExprLStmt GhcRn]
+postprocessApplicativeStmts lstmts = go [] $ reverse lstmts
     where
     go :: [ExprLStmt GhcRn] -> [ExprLStmt GhcRn] -> GHC.TcM [ExprLStmt GhcRn]
     
