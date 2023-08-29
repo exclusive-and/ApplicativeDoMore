@@ -11,7 +11,10 @@ library
     exposed-modules:    ApplicativeDoMore
 
     default-extensions:
+        DataKinds
         ImportQualifiedPost
+        LambdaCase
+        OverloadedStrings
         TupleSections
 
     build-depends:
