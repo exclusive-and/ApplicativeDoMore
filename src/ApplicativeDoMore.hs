@@ -64,42 +64,52 @@ rearrangeLStmts
     -> [ExprLStmt GhcRn]
     -> GHC.TcM [ExprLStmt GhcRn]
     
-rearrangeLStmts flavour = go emptyValBinds []
+rearrangeLStmts flavour = go . reverse
+    where
+    go (stmt@(L loc (LastStmt _ body stripped ret)) : stmts) = do
+        re <- rearrangeLetStmts stmts
+        case re of
+            Just (binds, same) -> do
+                last' <- rewriteLast flavour binds body stripped ret
+                pure (same ++ [L loc last'])
+            Nothing -> pure (reverse (stmt : stmts))
+        
+    go _ = error "No last statement"
+
+rearrangeLetStmts
+    :: [ExprLStmt GhcRn]
+    -> GHC.TcM (Maybe (ValBinds, [ExprLStmt GhcRn]))
+    
+rearrangeLetStmts = go emptyValBinds []
     where
     go
-        :: ValBinds                  -- Bindings we've moved
+        :: ValBinds                  -- Movable bindings
         -> [ExprLStmt GhcRn]         -- Statements we've kept the same
         -> [ExprLStmt GhcRn]         -- Statements left to process
-        -> GHC.TcM [ExprLStmt GhcRn]
+        -> GHC.TcM (Maybe (ValBinds, [ExprLStmt GhcRn]))
     
-    -- When we get to the last statement, try rewriting it.
-    go moved same [L loc (LastStmt _ body stripped ret)] = do
-        stmt' <- rewriteLast flavour moved body stripped ret
-        pure $ reverse (L loc stmt' : same)
+    go move same [] = pure (Just (move, same))
     
-    -- Try to move let-bindings into the last statement.
-    go moved same (stmt@(L _ (LetStmt _ binds)) : stmts) = do
+    go move same (stmt@(L _ (LetStmt _ binds)) : stmts) = do
         let bindNames = mkNameSet $ collectBinders binds
         binds' <- collectBinds binds
-        if bindsIn bindNames stmts
-            then go moved (stmt : same) stmts
-            else go (binds' `appendBinds` moved) same stmts
+        if bindsIn bindNames same
+            then go move (stmt : same) stmts
+            else go (binds' `appendBinds` move) same stmts
     
-    -- Keep anything that can't be moved exactly as-is.
-    go moved same (stmt : stmts) = do
-        GHC.traceRn "bringLetsToEnd" $ GHC.ppr stmts
-        go moved (stmt : same) stmts
+    go move same (stmt@(L _ ApplicativeStmt{}) : stmts) =
+        go move (stmt : same) stmts
     
-    go _ _ [] = error "No valid last statement"
-
+    go _move _same _ = pure Nothing
+    
 -- |
 -- Check whether a set of names would bind variables in subsequent statements.
 -- 
 bindsIn :: NameSet -> [ExprLStmt GhcRn] -> Bool
 bindsIn binds = go
     where
-    go []     = False
-    go [_one] = False
+    go [] = False
+    
     go (stmt : stmts) = not (null foundbinds) || go stmts
         where foundbinds = SYB.listify (`elemNameSet` binds) stmt
 
