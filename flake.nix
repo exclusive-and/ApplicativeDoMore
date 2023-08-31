@@ -3,7 +3,7 @@
     description = "Applicative Do Does More";
 
     inputs = {
-        nixpkgs.url = "nixpkgs/nixos-unstable";
+        nixpkgs.url = "nixpkgs/nixos-23.05";
     };
 
     outputs = { self, nixpkgs, ... }:
