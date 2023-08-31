@@ -2,10 +2,12 @@
 module ApplicativeDoMore where
 
 import Data.Generics qualified as SYB
+import Data.Maybe (isNothing)
 import GHC.Builtin.Names
 import GHC.Hs
 import GHC.Plugins qualified as GHC
-import GHC.Rename.Env (lookupQualifiedDoName)
+import GHC.Rename.Env
+    (lookupQualifiedDoName, lookupNameWithQualifier, lookupSyntax)
 import GHC.Tc.Types qualified as GHC
 import GHC.Tc.Utils.Monad qualified as GHC
 import GHC.Types.Name.Set
@@ -66,7 +68,7 @@ applicativeDoRewrite = SYB.everywhereM (SYB.mkM rewriteLExpr)
     rewrite (HsDo _ flavour (L loc stmts0)) = do
         GHC.traceRn "applicativeDoRewrite" $ GHC.ppr stmts0
         stmts1 <- rewriteDoStmts flavour stmts0
-        stmts2 <- postprocessApplicativeStmts stmts1
+        stmts2 <- postprocessApplicativeStmts flavour stmts1
         GHC.traceRn "applicativeDoRewrite" $ GHC.ppr stmts2
         pure (HsDo noExtField flavour (L loc stmts2))
         
@@ -147,6 +149,14 @@ rearrangeLetStmts = go emptyValBinds []
     go move same (stmt@(L _ ApplicativeStmt{}) : stmts) =
         go move (stmt : same) stmts
     
+    -- [Single binding in do-expression]
+    -- There is an edge case where a do-expression consists of exactly one
+    -- bind, followed by a 'LetStmt'. In that case, the renamer won't
+    -- rewrite the bind as an 'ApplicativeStmt', even though it is still
+    -- considered valid applicative do notation.
+    go move same (stmt@(L _ BindStmt{}) : []) =
+        pure (Just (move, stmt : same))
+    
     -- If we get something other than a 'LetStmt' or an 'ApplicativeStmt',
     -- then we'll incur 'Monad' anyway. Fail out immediately.
     go _move _same _ = pure Nothing
@@ -164,10 +174,7 @@ bindsIn binds = go
 
 
 mkHsLet :: HsLocalBinds GhcRn -> LHsExpr GhcRn -> HsExpr GhcRn
-mkHsLet binds expr = HsLet noExtField letTok binds inTok expr
-    where
-    letTok = L NoTokenLoc HsTok :: LHsToken "let" GhcRn
-    inTok  = L NoTokenLoc HsTok :: LHsToken "in" GhcRn
+mkHsLet binds expr = HsLet noExtField noHsTok binds noHsTok expr
 
 -- |
 -- Try to rewrite the last statement in a do-expression as a let-block with
@@ -238,10 +245,17 @@ rewriteReturn returnName pureName rewriteLet (L loc e) =
 -- If we find that we can't remove 'join' from one of the statements, fall
 -- back on the original expression with 'join's intact.
 -- 
-postprocessApplicativeStmts :: [ExprLStmt GhcRn] -> GHC.TcM [ExprLStmt GhcRn]
-postprocessApplicativeStmts lstmts = go [] $ reverse lstmts
+postprocessApplicativeStmts
+    :: HsDoFlavour
+    -> [ExprLStmt GhcRn]
+    -> GHC.TcM [ExprLStmt GhcRn]
+
+postprocessApplicativeStmts flavour lstmts = go [] $ reverse lstmts
     where
-    go :: [ExprLStmt GhcRn] -> [ExprLStmt GhcRn] -> GHC.TcM [ExprLStmt GhcRn]
+    go
+        :: [ExprLStmt GhcRn]
+        -> [ExprLStmt GhcRn]
+        -> GHC.TcM [ExprLStmt GhcRn]
     
     go acc [] = pure acc
     
@@ -254,8 +268,59 @@ postprocessApplicativeStmts lstmts = go [] $ reverse lstmts
     go acc (L loc (ApplicativeStmt x args _) : stmts) =
         go (L loc (ApplicativeStmt x args Nothing) : acc) stmts
     
+    -- Got a single 'BindStmt', so we need to rewrite it as an
+    -- 'ApplicativeStmt'.
+    -- 
+    -- See note [Single binding in do-expression].
+    go acc (L loc (BindStmt _ pat expr) : []) = do
+        (fmapOp, _) <-
+            lookupQualifiedDoStmtName (HsDoStmt flavour) fmapName
+        let arg  = ApplicativeArgOne Nothing pat expr False
+            args = [(fmapOp, arg)]
+        pure (L loc (ApplicativeStmt noExtField args Nothing) : acc)
+    
     -- Anything else and we immediately fail out.
     go _acc (_ : _stmts) = pure lstmts
+
+-- ** GHC.Rename.Expr Artefacts
+---------------------------------------------------------------------
+
+lookupQualifiedDoStmtName
+    :: HsStmtContext GhcRn
+    -> GHC.Name
+    -> GHC.TcM (SyntaxExpr GhcRn, FreeVars)
+
+lookupQualifiedDoStmtName ctx name =
+    case qualifiedDoModuleName_maybe ctx of
+        Nothing -> lookupStmtName ctx name
+        Just modName -> do
+            (name', fvs) <- lookupNameWithQualifier name modName
+            pure (mkSyntaxExpr $ nl_HsVar name', fvs)
+
+lookupStmtName
+    :: HsStmtContext GhcRn
+    -> GHC.Name
+    -> GHC.TcM (SyntaxExpr GhcRn, FreeVars)
+
+lookupStmtName ctx name
+    | isRebindableContext ctx
+    = lookupSyntax name
+    | otherwise
+    = pure (mkRnSyntaxExpr name, emptyFVs)
+
+isRebindableContext :: HsStmtContext GhcRn -> Bool
+isRebindableContext = \case
+    HsDoStmt flavour
+        | ListComp <- flavour       -> False
+        | DoExpr m <- flavour       -> isNothing m
+        | MDoExpr m <- flavour      -> isNothing m
+        | MonadComp <- flavour      -> True
+        | GhciStmtCtxt <- flavour   -> True
+    
+    ArrowExpr           -> False
+    PatGuard{}          -> False
+    ParStmtCtxt ctx     -> isRebindableContext ctx
+    TransStmtCtxt ctx   -> isRebindableContext ctx
 
 
 -- * Variable Bindings
