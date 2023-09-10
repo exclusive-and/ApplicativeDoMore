@@ -5,6 +5,7 @@ import Data.Generics qualified as SYB
 import Data.Maybe (isNothing)
 import GHC.Builtin.Names
 import GHC.Hs
+import GHC.Plugins (Plugin (..), defaultPlugin, purePlugin)
 import GHC.Plugins qualified as GHC
 import GHC.Rename.Env
     (lookupQualifiedDoName, lookupNameWithQualifier, lookupSyntax)
@@ -17,43 +18,41 @@ import GHC.Types.SrcLoc
 -- * Haskell Plugin
 ---------------------------------------------------------------------
 
-plugin :: GHC.Plugin
-plugin = GHC.defaultPlugin
-    { GHC.renamedResultAction
-        = afterRename
-    , GHC.pluginRecompile
-        = \ _cli -> pure GHC.NoForceRecompile
-    }
-    
-afterRename
-    :: [GHC.CommandLineOption]
-    -> GHC.TcGblEnv
-    -> HsGroup GhcRn
-    -> GHC.TcM (GHC.TcGblEnv, HsGroup GhcRn)
+plugin :: Plugin
 
-afterRename _cli env hsgroup = do
-    (env,) <$> applicativeDoRewrite hsgroup
+plugin = defaultPlugin
+    { renamedResultAction = afterRename
+    , pluginRecompile     = purePlugin
+    }
+
+    where
+    afterRename
+        :: [GHC.CommandLineOption]
+        -> GHC.TcGblEnv
+        -> HsGroup GhcRn
+        -> GHC.TcM (GHC.TcGblEnv, HsGroup GhcRn)
+
+    afterRename _cli env hsgroup =
+        (env,) <$> applicativeDoRewrite hsgroup
 
 
 -- * Applicative Do Rewrite Rule
 ---------------------------------------------------------------------
 
 -- |
--- Rewrite do-expressions so that 'LetStmt's only incur an 'Applicative'
--- constraint in TC.
+-- Rewrite do-expressions so that let-statements only need 'Applicative'.
 -- 
 -- GHC's renamer does the heavy lifting. All that's left to do is:
 -- 
---  - Find all the 'LetStmt's that can be moved.
+--  - Collect all the 'LetStmt' binders.
 --
---  - Rewrite the 'LastStmt' as a let-expression with the bindings from the
---    moveable 'LetStmt's.
+--  - Bring the collected binders inside the 'LastStmt'.
 --
 --  - Remove 'join' calls from any 'ApplicativeStmt's.
 -- 
 -- If any one of these steps fails, we fall back on the original expression
 -- and let TC incur the 'Monad' constraint.
--- 
+--   
 applicativeDoRewrite
     :: HsGroup GhcRn
     -> GHC.TcM (HsGroup GhcRn)
@@ -66,10 +65,9 @@ applicativeDoRewrite = SYB.everywhereM (SYB.mkM rewriteLExpr)
     rewrite :: HsExpr GhcRn -> GHC.TcM (HsExpr GhcRn)
     
     rewrite (HsDo _ flavour (L loc stmts0)) = do
-        GHC.traceRn "applicativeDoRewrite" $ GHC.ppr stmts0
         stmts1 <- rewriteDoStmts flavour stmts0
         stmts2 <- postprocessApplicativeStmts flavour stmts1
-        GHC.traceRn "applicativeDoRewrite" $ GHC.ppr stmts2
+        GHC.traceRn "applicativeDoRewrite-result" $ GHC.ppr stmts2
         pure (HsDo noExtField flavour (L loc stmts2))
         
     rewrite e = pure e
@@ -79,8 +77,7 @@ applicativeDoRewrite = SYB.everywhereM (SYB.mkM rewriteLExpr)
 ---------------------------------------------------------------------
 
 -- |
--- Try to rewrite the statements in a do-expression so that it doesn't incur
--- a 'Monad' constraint.
+-- Try to collect let-binders and move them to the last statement.
 -- 
 -- Skips rewriting if 'rearrangeLetStmts' fails.
 -- 
@@ -105,7 +102,7 @@ rewriteDoStmts flavour = go . reverse
     go _ = error "No last statement"
 
 -- |
--- Try to collect and move 'LetStmt' bindings.
+-- Try to collect the let-binders.
 -- 
 -- Fails if the main body of the do-expression is anything but 'LetStmt's or
 -- 'ApplicativeStmt's. Any other statements irrevocably invoke monadic binds.
@@ -177,8 +174,8 @@ mkHsLet :: HsLocalBinds GhcRn -> LHsExpr GhcRn -> HsExpr GhcRn
 mkHsLet binds expr = HsLet noExtField noHsTok binds noHsTok expr
 
 -- |
--- Try to rewrite the last statement in a do-expression as a let-block with
--- the provided bindings.
+-- Rewrite the last statement of a do-expression. Plugs the original body
+-- expression of the statement into a let-expression.
 -- 
 rewriteLast
     :: HsDoFlavour
@@ -239,8 +236,7 @@ rewriteReturn returnName pureName rewriteLet (L loc e) =
 ---------------------------------------------------------------------
 
 -- |
--- Try to remove any calls to 'join' from the 'ApplicativeStmt's. This is
--- what ultimately signals to TC that we only need 'Applicative'.
+-- Try to remove any occurances of 'join' from the 'ApplicativeStmt's.
 -- 
 -- If we find that we can't remove 'join' from one of the statements, fall
 -- back on the original expression with 'join's intact.
@@ -350,4 +346,3 @@ appendBinds (NValBinds xs xsigs) (NValBinds ys ysigs) =
 collectBinders :: HsLocalBinds GhcRn -> [IdP GhcRn]
 collectBinders = collectLocalBinders CollNoDictBinders
 
-    
