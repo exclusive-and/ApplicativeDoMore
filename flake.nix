@@ -11,20 +11,21 @@
         system = "x86_64-linux";
 
         pkgs = import nixpkgs { inherit system; };
-        ghc  = pkgs.haskell.packages.ghc96;
 
-        applicative-do-more = ghc.callCabal2nix "applicative-do-more" ./.
+        hs = pkgs.haskell.packages.ghc96;
+
+        applicative-do-more = hs.callCabal2nix "applicative-do-more" ./.
         { };
 
-        applicative-do-more-env = ghc.shellFor
+        applicative-do-more-env = hs.shellFor
         {
             packages = _: [ applicative-do-more ];
 
-            build-depends = [ ghc.ghc ];
+            build-depends = [ hs.ghc ];
 
             nativeBuildInputs = [
-                ghc.cabal-install
-                ghc.haskell-language-server
+                hs.cabal-install
+                hs.haskell-language-server
             ];
         };
     in
