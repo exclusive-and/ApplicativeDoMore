@@ -24,8 +24,8 @@ plugin = defaultPlugin
     { renamedResultAction = afterRename
     , pluginRecompile     = purePlugin
     }
-
     where
+
     afterRename
         :: [GHC.CommandLineOption]
         -> GHC.TcGblEnv
