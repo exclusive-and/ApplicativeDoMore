@@ -5,12 +5,11 @@ import Data.Generics qualified as SYB
 import Data.Maybe (isNothing)
 import GHC.Builtin.Names
 import GHC.Hs
-import GHC.Plugins (Plugin (..), defaultPlugin, purePlugin)
 import GHC.Plugins qualified as GHC
 import GHC.Rename.Env
-    (lookupQualifiedDoName, lookupNameWithQualifier, lookupSyntax)
-import GHC.Tc.Types qualified as GHC
-import GHC.Tc.Utils.Monad qualified as GHC
+import GHC.Tc.Types (TcM, TcGblEnv)
+import GHC.Tc.Utils.Monad (traceRn, wrapLocMA)
+import GHC.Types.Name
 import GHC.Types.Name.Set
 import GHC.Types.SrcLoc
 
@@ -18,19 +17,18 @@ import GHC.Types.SrcLoc
 -- * Haskell Plugin
 ---------------------------------------------------------------------
 
-plugin :: Plugin
+plugin :: GHC.Plugin
 
-plugin = defaultPlugin
-    { renamedResultAction = afterRename
-    , pluginRecompile     = purePlugin
+plugin = GHC.defaultPlugin
+    { GHC.renamedResultAction = afterRename
+    , GHC.pluginRecompile     = GHC.purePlugin
     }
     where
-
     afterRename
         :: [GHC.CommandLineOption]
-        -> GHC.TcGblEnv
+        -> TcGblEnv
         -> HsGroup GhcRn
-        -> GHC.TcM (GHC.TcGblEnv, HsGroup GhcRn)
+        -> TcM (TcGblEnv, HsGroup GhcRn)
 
     afterRename _cli env hsgroup =
         (env,) <$> applicativeDoRewrite hsgroup
@@ -55,19 +53,19 @@ plugin = defaultPlugin
 --   
 applicativeDoRewrite
     :: HsGroup GhcRn
-    -> GHC.TcM (HsGroup GhcRn)
+    -> TcM (HsGroup GhcRn)
 
 applicativeDoRewrite = SYB.everywhereM (SYB.mkM rewriteLExpr)
     where
-    rewriteLExpr :: LHsExpr GhcRn -> GHC.TcM (LHsExpr GhcRn)
-    rewriteLExpr = GHC.wrapLocMA rewrite
+    rewriteLExpr :: LHsExpr GhcRn -> TcM (LHsExpr GhcRn)
+    rewriteLExpr = wrapLocMA rewrite
     
-    rewrite :: HsExpr GhcRn -> GHC.TcM (HsExpr GhcRn)
+    rewrite :: HsExpr GhcRn -> TcM (HsExpr GhcRn)
     
     rewrite (HsDo _ flavour (L loc stmts0)) = do
         stmts1 <- rewriteDoStmts flavour stmts0
         stmts2 <- postprocessApplicativeStmts flavour stmts1
-        GHC.traceRn "applicativeDoRewrite-result" $ GHC.ppr stmts2
+        traceRn "applicativeDoRewrite-result" $ GHC.ppr stmts2
         pure (HsDo noExtField flavour (L loc stmts2))
         
     rewrite e = pure e
@@ -84,7 +82,7 @@ applicativeDoRewrite = SYB.everywhereM (SYB.mkM rewriteLExpr)
 rewriteDoStmts
     :: HsDoFlavour
     -> [ExprLStmt GhcRn]
-    -> GHC.TcM [ExprLStmt GhcRn]
+    -> TcM [ExprLStmt GhcRn]
     
 rewriteDoStmts flavour = go . reverse
     -- Note that we process statements in reverse order. This allows
@@ -109,7 +107,7 @@ rewriteDoStmts flavour = go . reverse
 -- 
 rearrangeLetStmts
     :: [ExprLStmt GhcRn]
-    -> GHC.TcM (Maybe (ValBinds, [ExprLStmt GhcRn]))
+    -> TcM (Maybe (ValBinds, [ExprLStmt GhcRn]))
     
 rearrangeLetStmts = go emptyValBinds []
     where
@@ -117,7 +115,7 @@ rearrangeLetStmts = go emptyValBinds []
         :: ValBinds                  -- Moveable bindings
         -> [ExprLStmt GhcRn]         -- Statements to keep the same
         -> [ExprLStmt GhcRn]         -- Statements left to process
-        -> GHC.TcM (Maybe (ValBinds, [ExprLStmt GhcRn]))
+        -> TcM (Maybe (ValBinds, [ExprLStmt GhcRn]))
     
     go move same [] = pure (Just (move, same))
     
@@ -183,7 +181,7 @@ rewriteLast
     -> LHsExpr GhcRn
     -> Maybe Bool
     -> SyntaxExpr GhcRn
-    -> GHC.TcM (ExprStmt GhcRn)
+    -> TcM (ExprStmt GhcRn)
     
 rewriteLast ctx binds body _stripped ret = do
     (returnName, _) <- lookupQualifiedDoName (HsDoStmt ctx) returnMName
@@ -203,8 +201,8 @@ rewriteLast ctx binds body _stripped ret = do
 -- Strips occurrences of 'return' or 'pure'.
 -- 
 rewriteReturn
-    :: GHC.Name
-    -> GHC.Name
+    :: Name
+    -> Name
     -> (LHsExpr GhcRn -> LHsExpr GhcRn)
     -> LHsExpr GhcRn
     -> LHsExpr GhcRn
@@ -244,14 +242,14 @@ rewriteReturn returnName pureName rewriteLet (L loc e) =
 postprocessApplicativeStmts
     :: HsDoFlavour
     -> [ExprLStmt GhcRn]
-    -> GHC.TcM [ExprLStmt GhcRn]
+    -> TcM [ExprLStmt GhcRn]
 
 postprocessApplicativeStmts flavour lstmts = go [] $ reverse lstmts
     where
     go
         :: [ExprLStmt GhcRn]
         -> [ExprLStmt GhcRn]
-        -> GHC.TcM [ExprLStmt GhcRn]
+        -> TcM [ExprLStmt GhcRn]
     
     go acc [] = pure acc
     
@@ -283,8 +281,8 @@ postprocessApplicativeStmts flavour lstmts = go [] $ reverse lstmts
 
 lookupQualifiedDoStmtName
     :: HsStmtContext GhcRn
-    -> GHC.Name
-    -> GHC.TcM (SyntaxExpr GhcRn, FreeVars)
+    -> Name
+    -> TcM (SyntaxExpr GhcRn, FreeVars)
 
 lookupQualifiedDoStmtName ctx name =
     case qualifiedDoModuleName_maybe ctx of
@@ -295,8 +293,8 @@ lookupQualifiedDoStmtName ctx name =
 
 lookupStmtName
     :: HsStmtContext GhcRn
-    -> GHC.Name
-    -> GHC.TcM (SyntaxExpr GhcRn, FreeVars)
+    -> Name
+    -> TcM (SyntaxExpr GhcRn, FreeVars)
 
 lookupStmtName ctx name
     | isRebindableContext ctx
@@ -333,7 +331,7 @@ type ValBinds = NHsValBindsLR GhcRn
 emptyValBinds :: ValBinds
 emptyValBinds = NValBinds [] []
 
-collectBinds :: HsLocalBinds GhcRn -> GHC.TcM ValBinds
+collectBinds :: HsLocalBinds GhcRn -> TcM ValBinds
 collectBinds = \case
     HsValBinds _ (XValBindsLR binds)
         -> pure binds
